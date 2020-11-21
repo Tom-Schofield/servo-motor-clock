@@ -2,6 +2,7 @@
 #include <avr/interrupt.h>
 #include <util/delay.h>
 #include <util/twi.h>
+#include <string.h>
 
 #define TRUE 1
 #define FALSE 0
@@ -21,7 +22,24 @@ typedef enum {
 	RECEIVING=3,
 } i2c_state_t;
 
-alarm_state_t alarm_state = OFF;
+typedef enum app_state {
+	WAITING=0,
+	TIME_SET_M_ONES=1,
+	TIME_SET_M_TENS=2,
+	TIME_SET_H_ONES=3,
+	TIME_SET_H_TENS=4,
+	TIME_SET_AM_PM=5,
+	ALARM_SET_M_ONES=6,
+	ALARM_SET_M_TENS=7,
+	ALARM_SET_H_ONES=8,
+	ALARM_SET_H_TENS=9,
+	ALARM_SET_AM_PM=10,
+	UPDATE=11,
+} app_state_t;
+
+app_state_t app_state = WAITING;
+
+alarm_state_t alarm_state = ON;
 uint32_t alarm_on_time = 0;
 uint32_t alarm_off_time = 0; 
 uint32_t alarm_duration = 1000; // On / Off time duration (ms)
@@ -29,6 +47,10 @@ uint32_t alarm_duration = 1000; // On / Off time duration (ms)
 uint8_t pb_state = OFF;
 uint32_t db_up = 0;
 uint32_t db_down = 0;
+uint32_t lng_p = 0;
+uint8_t lng_p_state = OFF;
+uint8_t shrt_p_state = OFF;
+uint8_t settings_updated = FALSE;
 
 volatile uint32_t ticks = 0; // Incremented in ISR
 				/*	 REG1  REG2  REG3 */
@@ -38,6 +60,11 @@ char reg_data [3][3] = {{0xFF, 0xFF, 0xFF}, \
 volatile pwm_state = 0;
 volatile uint8_t on_time = FALSE;
 volatile uint8_t tx_complete = FALSE;
+volatile uint16_t millis = 0; // Less accurate hardware timer. 
+volatile uint8_t count = 0;
+volatile uint16_t current_time = 0;
+uint16_t start_time = 0;
+uint8_t alarm_on = OFF;
 
 volatile uint8_t i2c_data = 0; // Data byte
 volatile uint8_t i2c_command = 0; // Command / Control byte
@@ -58,6 +85,19 @@ uint8_t rtc_reg[7] = {0}; // Holds most recent read of the timekeeping registers
 uint8_t sseg_values[] = {0b1111110,0b0110000,0b1101101,0b1111001,0b0110011, \
 	0b1011011,0b1011111,0b1110000,0b1111111,0b1110011};
 
+uint8_t t_min_ones = 0; // Minutes, ones
+uint8_t t_min_tens = 0; // Minutes, tens
+uint8_t t_hr_ones = 0; // Hours, ones
+uint8_t t_hr_tens = 0; // Hours, tens
+uint8_t t_am_pm = 0; // AM PM indicator
+uint8_t alarm_set = FALSE;
+uint8_t a_min_ones = 0;
+uint8_t a_min_tens = 0;
+uint8_t a_hr_ones = 0;
+uint8_t a_hr_tens = 0;
+uint8_t a_am_pm = 0;
+
+
 uint8_t bin_2_bcd(uint8_t bin){
 	return (((bin / 10) << 4) | (bin % 10));
 }
@@ -66,50 +106,71 @@ uint8_t bcd_2_bin(uint8_t bcd){
 	return ((bcd & 0xF0) >> 4)*10 + (bcd & 0x0F);
 }
 
-uint8_t count = 0;
+/*
+ * Returns TRUE if the set alarm time matches the current time and the alarm has been set
+ */
+uint8_t check_sound_alarm(void){
+	return (t_hr_tens) == (a_hr_tens) && (t_hr_ones) == (a_hr_ones) &&
+		(t_min_tens) == (a_min_tens) && (t_min_ones) == (a_min_ones) &&
+	 	(a_am_pm == t_am_pm) && alarm_set;
+}
+
+
+/*
+ * Handles the push button debouncing and disctrimination between long and short button presses
+ */
+void update_pb_status(void){
+	if(!(PIND & (1 << 7))){
+		db_up++;
+	} else if((PIND & (1 << 7))){
+		db_down++;
+	}
+
+	if(db_up > 1){
+		pb_state = ON;
+		db_up = 0;
+		lng_p++;
+	} else if(db_down > 5) {
+		if(!(lng_p_state == ON) && (pb_state == ON)){
+			shrt_p_state = ON; // Confirmed short press
+		}
+		pb_state = OFF;
+		db_down = 0;
+		
+		lng_p = 0;
+		lng_p_state = OFF;
+	}
+	
+	if(lng_p > 35){
+		lng_p_state = ON;
+		shrt_p_state = OFF;
+	}
+}
 
 /*
  * Updates the PWM values with the sseg values based on the RTC register data
  */
 void update_time_display(void){
 
-	count = (count + 1) % 10;
-	uint8_t min_ones = rtc_reg[1] & 0x0F; // Minutes, ones
-	uint8_t min_tens = (rtc_reg[1] & 0x70) >> 4; // Minutes, tens
-	uint8_t hr_ones = rtc_reg[2] & 0x0F; // Hours, ones
-	uint8_t hr_tens = rtc_reg[2] & 0x10 >> 4; // Hours, tens
-	// reg_data[2][2] = ((sseg_values[min_ones] << 1) | hr_tens);
-	// reg_data[2][1] = ((sseg_values[min_tens] << 1));
-	// reg_data[2][0] = (sseg_values[hr_ones] << 1);
-	
-	// reg_data[1][2] = ((sseg_values[min_ones] << 1) | hr_tens);
-	// reg_data[1][1] = ((sseg_values[min_tens] << 1));
-	// reg_data[1][0] = (sseg_values[hr_ones] << 1);
-
-	// reg_data[0][2] = 0xFF;
-	// reg_data[0][1] = 0xFF;
-	// reg_data[0][0] = 0xFF;
-
-	// reg_data[1][2] = 0xFF;
-	// reg_data[1][1] = 0xFF;
-	// reg_data[1][0] = 0xFF;
-	
 	reg_data[2][2] = 0xFF;
 	reg_data[2][1] = 0xFF;
-	reg_data[2][0] = (sseg_values[min_ones] << 1);
 
 	reg_data[1][2] = 0xFF;
 	reg_data[1][1] = 0xFF;
-	reg_data[1][0] = (sseg_values[min_tens] << 1) | hr_tens;
-
+	
 	reg_data[0][2] = 0xFF;
 	reg_data[0][1] = 0xFF;
-	reg_data[0][0] = (sseg_values[hr_ones] << 1) | hr_tens;
 
-	// uint8_t datax = (sseg_values[min_tens] << 1);
-	// reg_data[2][2] = 0xFF;
-	// reg_data[2][1] = datax;
-	// reg_data[2][0] = datax;
+	if((app_state >= ALARM_SET_M_ONES) && (app_state <= ALARM_SET_AM_PM)){
+		reg_data[2][0] = (sseg_values[a_min_ones] << 1);
+		reg_data[1][0] = (sseg_values[a_min_tens] << 1) | a_hr_tens;
+		reg_data[0][0] = (sseg_values[a_hr_ones] << 1) | a_hr_tens;
+	} else{
+		reg_data[2][0] = (sseg_values[t_min_ones] << 1);
+		reg_data[1][0] = (sseg_values[t_min_tens] << 1) | t_hr_tens;
+		reg_data[0][0] = (sseg_values[t_hr_ones] << 1) | t_hr_tens;
+	}
+	
 }
 
 /*
@@ -144,10 +205,8 @@ void init_gpio(void) {
 	PORTC = (PORTC & (~(1 << PC1)));
 	PORTC = (PORTC & (~(1 << PC2)));
 	PORTC = (1 << PC3); 
-	PORTD = (1 << PD0) & ~(1 << PD5);
+	PORTD = (1 << PD0); // Reset is active low. Keep high.
 }
-
-
 
 /*
  * Initialises SPI for driving shift registers
@@ -301,6 +360,11 @@ ISR(TIMER1_COMPA_vect)
 	
 	switch(pwm_state) {
 		case 0:
+			count++;
+			if(count >= 20){
+				count = 0;
+				millis++;
+			}
 			OCR1A = 998;
 			on_time = TRUE;
 			tx_complete = FALSE;
@@ -337,7 +401,7 @@ ISR(TIMER1_COMPA_vect)
  */
 void init_rtc(void){
 	uint8_t data [] = {(1 << 7), 0x00, (1 << 6)};
-	i2c_send_data(0b11011110, 0x00, &data[0], WRITE, 1); // Start RTC by writing 1 to ST bit
+	i2c_send_data(0b11011110, 0x00, &data[0], WRITE, 1); // Start RTC by writing 1 to ST bit, specify 12 hour time format
 	for(int i=0; i < 50; i++){}
 }
 
@@ -350,6 +414,7 @@ ISR(SPI_STC_vect)
     // PORTB = (PORTB & (~(1 << 0))) | (flag << 0); // Set bit
 }
 uint8_t init=0;
+
 /*
  * Main loop
  */
@@ -388,29 +453,131 @@ int main(int argc, char** argv){
 						if(init == 0){
 							init_rtc(); // Initialises the MCP7940 RTC
 							init = 1;
-						} else{
-							i2c_send_data(0b11011110, 0x00, 0x00, READ, 7); // Read RTC registers
-							while(!i2c_state == STOP);
-							memcpy(&rtc_reg, &i2c_recv,7);
+
+						} else {
+							
 							update_time_display();
-						}
+							update_pb_status();
+
+							switch(app_state){
+								case WAITING:
+									i2c_send_data(0b11011110, 0x00, 0x00, READ, 7); // Read RTC registers
+									while(!i2c_state == STOP);
+									memcpy(&rtc_reg, &i2c_recv,7);
+
+									t_min_ones = rtc_reg[1] & 0x0F; // Minutes, ones
+									t_min_tens = (rtc_reg[1] & 0x70) >> 4; // Minutes, tens
+									t_hr_ones = rtc_reg[2] & 0x0F; // Hours, ones
+									t_hr_tens = rtc_reg[2] & 0x10 >> 4; // Hours, tens
+									t_am_pm = (rtc_reg[2] & (1 << 5) >> 5);
+									
+									PORTB &= ~1;
+									PORTB |= t_am_pm;
+
+									if(lng_p_state == ON){ // Move to to adjust settings on a long press
+										app_state = TIME_SET_M_ONES;
+										lng_p_state = OFF;
+										lng_p = 0;
+									}
+
+									current_time = millis;
+									
+									if(check_sound_alarm()){ // Checks if the current time matches the alarm time
+										alarm_state = ON; // Sound the alarm
+										start_time = current_time;
+									}
+
+									if((alarm_state == ON) && ((current_time - start_time) > 500)){
+										alarm_on ^= 1; // Toggle the alarms state
+										PORTD |= alarm_on << 5; // Write alarm start
+										start_time = current_time; // Reset 500ms count
+									} 
+
+									if(shrt_p_state == ON){
+										alarm_state = OFF; // Turn off the alarm when the push button is pressed
+									}
+
+									break;
+
+								case TIME_SET_M_ONES:
+								case TIME_SET_M_TENS:
+								case TIME_SET_H_ONES:
+								case TIME_SET_H_TENS:
+								case TIME_SET_AM_PM:
+									if(lng_p_state == ON){
+										if(settings_updated == FALSE){ // If the settings haven't been changed
+											app_state = UPDATE;			// & there is a consecutive long press
+											alarm_set= FALSE;			// Skip to the update phase. Alarm will not be set!!!!
+										} else { // Otherwise save the settings
+											app_state = (app_state + 1) % 12;
+											lng_p_state = OFF;
+											lng_p = 0;
+										}
+									} else if(shrt_p_state == ON){
+										
+										t_min_ones = (app_state == TIME_SET_M_ONES) ? (t_min_ones + 1) % 10 : t_min_ones;
+										t_min_tens = (app_state == TIME_SET_M_TENS) ? (t_min_tens + 1) % 6 : t_min_tens;
+										t_hr_ones = (app_state == TIME_SET_H_ONES) ? (t_hr_ones + 1) % 10 : t_hr_ones;
+										t_hr_tens = (app_state == TIME_SET_H_TENS) ? (t_hr_tens + 1) % 1 : t_hr_tens;
+										t_am_pm = (app_state == TIME_SET_AM_PM) ? t_am_pm ^ 1 : t_am_pm;
+
+										shrt_p_state = OFF;
+										settings_updated = TRUE;
+										lng_p_state = OFF;
+										lng_p = 0;
+
+										PORTB &= ~1;
+										PORTB |= t_am_pm;
+									}
+									break;
+								case ALARM_SET_M_ONES:
+								case ALARM_SET_M_TENS:
+								case ALARM_SET_H_ONES:
+								case ALARM_SET_H_TENS:
+								case ALARM_SET_AM_PM:
+									if(lng_p_state == ON){
+										if(settings_updated == FALSE){ // If the settings haven't been changed
+											app_state = UPDATE;			// & there is a consecutive long press
+											alarm_set= FALSE;		   // Skip to the update phase. Alarm will not be set!!!!
+										} else { // Otherwise save the settings
+											app_state = (app_state + 1) % 12;
+											lng_p_state = OFF;
+											lng_p = 0;
+											alarm_set = (app_state == ALARM_SET_AM_PM) ? TRUE : FALSE;
+										}
+									} else if(shrt_p_state == ON){
+										
+										a_min_ones = (app_state == ALARM_SET_M_ONES) ? (a_min_ones + 1) % 10 : a_min_ones;
+										a_min_tens = (app_state == ALARM_SET_M_TENS) ? (a_min_tens + 1) % 6 : a_min_tens;
+										a_hr_ones = (app_state == ALARM_SET_H_ONES) ? (a_hr_ones + 1) % 10 : a_hr_ones;
+										a_hr_tens = (app_state == ALARM_SET_H_TENS) ? (a_hr_tens + 1) % 1 : a_hr_tens;
+										a_am_pm = (app_state == ALARM_SET_AM_PM) ? a_am_pm ^ 1 : a_am_pm;
+
+										shrt_p_state = OFF;
+										settings_updated = TRUE;
+										lng_p_state = OFF;
+										lng_p = 0;
+
+										PORTB &= ~1;
+										PORTB |= a_am_pm;
+									}
+
+									break;
+								case UPDATE: // Write out the updated timekeeping registers
+									rtc_reg[0] = rtc_reg[0] & (1 << 7); // Clear the seconds
+									rtc_reg[1] = ((t_min_tens & 0x07) << 4) | t_min_ones;
+									rtc_reg[2] = ((t_am_pm & 1) << 5) | ((t_hr_tens & 1) << 4) | (t_hr_ones & 0x0F);
+
+									i2c_send_data(0b11011110, 0x00, &rtc_reg[0], WRITE, 3); // Read RTC registers
+									for(int i=0; i < 50; i++){}
+									app_state = WAITING;
+
+									break;
+							}
 					}
-				}
-
-				if((PORTD & (1 << 7)) && (pb_state == OFF)){
-					db_up++;
-				} else if(!(PORTD & (1 << 7)) && (pb_state == ON)) {
-					db_down++;
-				}
-
-				if(deb_up > 500){
-					pb_state = ON;
-					db_up = 0;
-				} else if(db_down > 500) {
-					pb_state = OFF:
-					db_down = 0;
-				}
 			}
+		}
 			
 	}
+}
 }
